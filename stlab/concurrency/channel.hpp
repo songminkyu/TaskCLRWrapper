@@ -18,14 +18,14 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 #include <stlab/concurrency/executor_base.hpp>
-#include <stlab/concurrency/optional.hpp>
 #include <stlab/concurrency/traits.hpp>
 #include <stlab/concurrency/tuple_algorithm.hpp>
-#include <stlab/concurrency/variant.hpp>
 #include <stlab/functional.hpp>
 #include <stlab/memory.hpp>
 
@@ -191,19 +191,19 @@ using avoid = std::conditional_t<std::is_same<void, T>::value, avoid_, T>;
 /**************************************************************************************************/
 
 template <typename F, std::size_t... I, typename... T>
-auto invoke_(F&& f, std::tuple<variant<T, std::exception_ptr>...>& t, std::index_sequence<I...>) {
+auto invoke_(F&& f, std::tuple<std::variant<T, std::exception_ptr>...>& t, std::index_sequence<I...>) {
     return std::forward<F>(f)(std::move(std::get<I>(t))...);
 }
 
 template <typename F, typename... Args>
-auto avoid_invoke(F&& f, std::tuple<variant<Args, std::exception_ptr>...>& t)
+auto avoid_invoke(F&& f, std::tuple<std::variant<Args, std::exception_ptr>...>& t)
     -> std::enable_if_t<!std::is_same<void, yield_type<unwrap_reference_t<F>, Args...>>::value,
                         yield_type<unwrap_reference_t<F>, Args...>> {
     return invoke_(std::forward<F>(f), t, std::make_index_sequence<sizeof...(Args)>());
 }
 
 template <typename F, typename... Args>
-auto avoid_invoke(F&& f, std::tuple<variant<Args, std::exception_ptr>...>& t)
+auto avoid_invoke(F&& f, std::tuple<std::variant<Args, std::exception_ptr>...>& t)
     -> std::enable_if_t<std::is_same<void, yield_type<unwrap_reference_t<F>, Args...>>::value,
                         avoid_> {
     invoke_(std::forward<F>(f), t, std::make_index_sequence<sizeof...(Args)>());
@@ -216,7 +216,7 @@ template <std::size_t S>
 struct invoke_variant_dispatcher {
     template <typename F, typename T, typename... Args, std::size_t... I>
     static auto invoke_(F&& f, T& t, std::index_sequence<I...>) {
-        return std::forward<F>(f)(std::move(stlab::get<Args>(std::get<I>(t)))...);
+        return std::forward<F>(f)(std::move(std::get<Args>(std::get<I>(t)))...);
     }
 
     template <typename F, typename T, typename... Args>
@@ -228,25 +228,16 @@ struct invoke_variant_dispatcher {
 
 template <>
 struct invoke_variant_dispatcher<1> {
-    template <typename F, typename T, typename Arg>
-    static auto invoke_(F&&, T&) -> std::enable_if_t<std::is_same<Arg, void>::value, void> {
-        return;
-    }
-    template <typename F, typename T, typename Arg>
-    static auto invoke_(F&& f, T&) -> std::enable_if_t<std::is_same<Arg, detail::avoid_>::value,
-                                                       decltype(std::forward<F>(f)())> {
-        return std::forward<F>(f)();
-    }
-    template <typename F, typename T, typename Arg>
-    static auto invoke_(F&& f, T& t) -> std::enable_if_t<
-        !(std::is_same<Arg, detail::avoid_>::value || std::is_same<Arg, detail::avoid_>::value),
-        decltype(std::forward<F>(f)(std::move(stlab::get<Arg>(std::get<0>(t)))))> {
-        return std::forward<F>(f)(std::move(stlab::get<Arg>(std::get<0>(t))));
-    }
-
     template <typename F, typename T, typename... Args>
-    static auto invoke(F&& f, T& t) {
-        return invoke_<F, T, first_t<Args...>>(std::forward<F>(f), t);
+    static auto invoke(F&& f, [[maybe_unused]] T& t) {
+        using arg1_t = first_t<Args...>;
+        if constexpr (std::is_same_v<arg1_t, void>) {
+            return;
+        } else if constexpr (std::is_same_v<arg1_t, detail::avoid_>) {
+            return std::forward<F>(f)();
+        } else {
+            return std::forward<F>(f)(std::move(std::get<arg1_t>(std::get<0>(t))));
+        }
     }
 };
 
@@ -303,13 +294,13 @@ template <typename T>
 constexpr bool has_process_close_v = is_detected_v<process_close_t, T>;
 
 template <typename T>
-auto process_close(stlab::optional<T>& x)
+auto process_close(std::optional<T>& x)
     -> std::enable_if_t<has_process_close_v<unwrap_reference_t<T>>> {
     if (x) unwrap(*x).close();
 }
 
 template <typename T>
-auto process_close(stlab::optional<T>&)
+auto process_close(std::optional<T>&)
     -> std::enable_if_t<!has_process_close_v<unwrap_reference_t<T>>> {}
 
 /**************************************************************************************************/
@@ -321,13 +312,13 @@ template <typename T>
 constexpr bool has_process_state_v = is_detected_v<process_state_t, T>;
 
 template <typename T>
-auto get_process_state(const stlab::optional<T>& x)
+auto get_process_state(const std::optional<T>& x)
     -> std::enable_if_t<has_process_state_v<unwrap_reference_t<T>>, process_state_scheduled> {
     return unwrap(*x).state();
 }
 
 template <typename T>
-auto get_process_state(const stlab::optional<T>&)
+auto get_process_state(const std::optional<T>&)
     -> std::enable_if_t<!has_process_state_v<unwrap_reference_t<T>>, process_state_scheduled> {
     return await_forever;
 }
@@ -348,7 +339,7 @@ auto set_process_error(P& process, std::exception_ptr&& error)
 }
 
 template <typename P>
-auto set_process_error(P&, std::exception_ptr &&)
+auto set_process_error(P&, std::exception_ptr&&)
     -> std::enable_if_t<!has_set_process_error_v<unwrap_reference_t<P>>, void> {}
 
 /**************************************************************************************************/
@@ -371,30 +362,30 @@ constexpr bool has_process_await_v = is_detected_v<process_await_t, T, Args...>;
 
 template <typename P, typename... T, std::size_t... I>
 void await_variant_args_(P& process,
-                         std::tuple<variant<detail::avoid<T>, std::exception_ptr>...>& args,
+                         std::tuple<std::variant<detail::avoid<T>, std::exception_ptr>...>& args,
                          std::index_sequence<I...>) {
-    unwrap(process).await(std::move(stlab::get<T>(std::get<I>(args)))...);
+    unwrap(process).await(std::move(std::get<T>(std::get<I>(args)))...);
 }
 
 template <typename P, typename... T>
 void await_variant_args(P& process,
-                        std::tuple<variant<detail::avoid<T>, std::exception_ptr>...>& args) {
+                        std::tuple<std::variant<detail::avoid<T>, std::exception_ptr>...>& args) {
     await_variant_args_<P, T...>(process, args, std::make_index_sequence<sizeof...(T)>());
 }
 
 /**************************************************************************************************/
 
 template <typename T>
-stlab::optional<std::exception_ptr> find_argument_error(T& argument) {
-    stlab::optional<std::exception_ptr> result;
+std::optional<std::exception_ptr> find_argument_error(T& argument) {
+    std::optional<std::exception_ptr> result;
 
     auto error_index = tuple_find(argument, [](const auto& c) {
-        return static_cast<message_t>(index(c)) == message_t::error;
+        return static_cast<message_t>(c.index()) == message_t::error;
     });
 
     if (error_index != std::tuple_size<T>::value) {
         result = get_i(
-            argument, error_index, [](auto& elem) { return stlab::get<std::exception_ptr>(elem); },
+            argument, error_index, [](auto& elem) { return std::get<std::exception_ptr>(elem); },
             std::exception_ptr{});
     }
 
@@ -406,9 +397,9 @@ stlab::optional<std::exception_ptr> find_argument_error(T& argument) {
 template <typename T>
 struct default_queue_strategy {
     static const std::size_t arguments_size = 1;
-    using value_type = std::tuple<variant<avoid<T>, std::exception_ptr>>;
+    using value_type = std::tuple<std::variant<avoid<T>, std::exception_ptr>>;
 
-    std::deque<variant<avoid<T>, std::exception_ptr>> _queue;
+    std::deque<std::variant<avoid<T>, std::exception_ptr>> _queue;
 
     bool empty() const { return _queue.empty(); }
 
@@ -435,9 +426,9 @@ template <typename... T>
 struct zip_with_queue_strategy {
     static const std::size_t Size = sizeof...(T);
     static const std::size_t arguments_size = Size;
-    using value_type = std::tuple<variant<T, std::exception_ptr>...>;
+    using value_type = std::tuple<std::variant<T, std::exception_ptr>...>;
     using queue_size_t = std::array<std::size_t, Size>;
-    using queue_t = std::tuple<std::deque<variant<T, std::exception_ptr>>...>;
+    using queue_t = std::tuple<std::deque<std::variant<T, std::exception_ptr>>...>;
 
     queue_t _queue;
 
@@ -483,10 +474,10 @@ template <typename... T>
 struct round_robin_queue_strategy {
     static const std::size_t Size = sizeof...(T);
     static const std::size_t arguments_size = 1;
-    using item_t = variant<first_t<T...>, std::exception_ptr>;
+    using item_t = std::variant<first_t<T...>, std::exception_ptr>;
     using value_type = std::tuple<item_t>;
     using queue_size_t = std::array<std::size_t, Size>;
-    using queue_t = std::tuple<std::deque<variant<T, std::exception_ptr>>...>;
+    using queue_t = std::tuple<std::deque<std::variant<T, std::exception_ptr>>...>;
     std::size_t _index{0};
     std::size_t _popped_index{0};
     queue_t _queue;
@@ -539,10 +530,10 @@ template <typename... T>
 struct unordered_queue_strategy {
     static const std::size_t Size = sizeof...(T);
     static const std::size_t arguments_size = 1;
-    using item_t = variant<first_t<T...>, std::exception_ptr>;
+    using item_t = std::variant<first_t<T...>, std::exception_ptr>;
     using value_type = std::tuple<item_t>;
     using queue_size_t = std::array<std::size_t, Size>;
-    using queue_t = std::tuple<std::deque<variant<T, std::exception_ptr>>...>;
+    using queue_t = std::tuple<std::deque<std::variant<T, std::exception_ptr>>...>;
     std::size_t _index{0};
     std::size_t _popped_index{0};
     queue_t _queue;
@@ -597,8 +588,8 @@ template <typename Q, typename T, typename R, typename Arg, std::size_t I, typen
 struct shared_process_sender_indexed : public shared_process_sender<Arg> {
     shared_process<Q, T, R, Args...>& _shared_process;
 
-    explicit
-    shared_process_sender_indexed(shared_process<Q, T, R, Args...>& sp) : _shared_process(sp) {}
+    explicit shared_process_sender_indexed(shared_process<Q, T, R, Args...>& sp) :
+        _shared_process(sp) {}
 
     void add_sender() override { ++_shared_process._sender_count; }
 
@@ -652,9 +643,7 @@ struct shared_process_sender_helper;
 template <typename Q, typename T, typename R, std::size_t... I, typename... Args>
 struct shared_process_sender_helper<Q, T, R, std::index_sequence<I...>, Args...>
     : shared_process_sender_indexed<Q, T, R, Args, I, Args...>... {
-    
-    explicit
-    shared_process_sender_helper(shared_process<Q, T, R, Args...>& sp) :
+    explicit shared_process_sender_helper(shared_process<Q, T, R, Args...>& sp) :
         shared_process_sender_indexed<Q, T, R, Args, I, Args...>(sp)... {}
 };
 
@@ -698,14 +687,14 @@ template <typename R>
 struct downstream<
     R,
     std::enable_if_t<!std::is_copy_constructible<R>::value && !std::is_same<R, void>::value>> {
-    stlab::optional<sender<R>> _data;
+    std::optional<sender<R>> _data;
 
     template <typename F>
     void append_receiver(F&& f) {
         _data = std::forward<F>(f);
     }
 
-    void clear() { _data = stlab::nullopt; }
+    void clear() { _data = std::nullopt; }
 
     std::size_t size() const { return 1; }
 
@@ -748,7 +737,7 @@ struct shared_process
     queue_strategy_t _queue;
 
     executor_t _executor;
-    stlab::optional<process_t> _process;
+    std::optional<process_t> _process;
 
     std::mutex _process_mutex;
 
@@ -767,8 +756,6 @@ struct shared_process
     std::atomic_size_t _process_buffer_size{1};
 
     const std::tuple<std::shared_ptr<shared_process_receiver<Args>>...> _upstream;
-
-
 
     template <typename E, typename F>
     shared_process(E&& e, F&& f) :
@@ -834,7 +821,7 @@ struct shared_process
         if (do_final) {
             std::unique_lock<std::mutex> lock(_downstream_mutex);
             _downstream.clear(); // This will propagate the close to anything downstream
-            _process = stlab::nullopt;
+            _process = std::nullopt;
         }
     }
 
@@ -866,7 +853,7 @@ struct shared_process
     }
 
     auto pop_from_queue() {
-        stlab::optional<typename Q::value_type> message;
+        std::optional<typename Q::value_type> message;
         std::array<bool, sizeof...(Args)> do_cts = {{false}};
         bool do_close = false;
 
@@ -886,7 +873,7 @@ struct shared_process
 
     bool dequeue() {
         using queue_t = typename Q::value_type;
-        stlab::optional<queue_t> message;
+        std::optional<queue_t> message;
         std::array<bool, sizeof...(Args)> do_cts;
         bool do_close = false;
 
@@ -954,12 +941,12 @@ struct shared_process
                     std::chrono::nanoseconds::min())
                     broadcast(unwrap(*_process).yield());
                 else
-                    execute_at(duration,
-                               _executor)([_weak_this = make_weak_ptr(this->shared_from_this())] {
-                        auto _this = _weak_this.lock();
-                        if (!_this) return;
-                        _this->try_broadcast();
-                    });
+                    execute_at(duration, _executor)(
+                        [_weak_this = make_weak_ptr(this->shared_from_this())]() noexcept {
+                            auto _this = _weak_this.lock();
+                            if (!_this) return;
+                            _this->try_broadcast();
+                        });
             }
 
             /*
@@ -978,25 +965,25 @@ struct shared_process
             } else {
                 /* Schedule a timeout. */
                 _timeout_function_active = true;
-                execute_at(duration,
-                           _executor)([_weak_this = make_weak_ptr(this->shared_from_this())] {
-                    auto _this = _weak_this.lock();
-                    // It may be that the complete channel is gone in the meanwhile
-                    if (!_this) return;
+                execute_at(duration, _executor)(
+                    [_weak_this = make_weak_ptr(this->shared_from_this())]() noexcept {
+                        auto _this = _weak_this.lock();
+                        // It may be that the complete channel is gone in the meanwhile
+                        if (!_this) return;
 
-                    // try_lock can fail spuriously
-                    while (true) {
-                        lock_t lock(_this->_timeout_function_control, std::try_to_lock);
-                        if (!lock) continue;
+                        // try_lock can fail spuriously
+                        while (true) {
+                            lock_t lock(_this->_timeout_function_control, std::try_to_lock);
+                            if (!lock) continue;
 
-                        // we were cancelled
-                        if (get_process_state(_this->_process).first != process_state::yield) {
-                            _this->try_broadcast();
-                            _this->_timeout_function_active = false;
+                            // we were cancelled
+                            if (get_process_state(_this->_process).first != process_state::yield) {
+                                _this->try_broadcast();
+                                _this->_timeout_function_active = false;
+                            }
+                            return;
                         }
-                        return;
-                    }
-                });
+                    });
             }
         } catch (...) { // this catches exceptions during _process.await() and _process.yield()
             broadcast(std::move(std::current_exception()));
@@ -1038,12 +1025,12 @@ struct shared_process
                     std::chrono::nanoseconds::min())
                     broadcast(unwrap(*_process).yield());
                 else
-                    execute_at(duration,
-                               _executor)([_weak_this = make_weak_ptr(this->shared_from_this())] {
-                        auto _this = _weak_this.lock();
-                        if (!_this) return;
-                        _this->try_broadcast();
-                    });
+                    execute_at(duration, _executor)(
+                        [_weak_this = make_weak_ptr(this->shared_from_this())]() noexcept {
+                            auto _this = _weak_this.lock();
+                            if (!_this) return;
+                            _this->try_broadcast();
+                        });
             }
 
             /*
@@ -1062,25 +1049,25 @@ struct shared_process
             } else {
                 /* Schedule a timeout. */
                 _timeout_function_active = true;
-                execute_at(duration,
-                           _executor)([_weak_this = make_weak_ptr(this->shared_from_this())] {
-                    auto _this = _weak_this.lock();
-                    // It may be that the complete channel is gone in the meanwhile
-                    if (!_this) return;
+                execute_at(duration, _executor)(
+                    [_weak_this = make_weak_ptr(this->shared_from_this())]() noexcept {
+                        auto _this = _weak_this.lock();
+                        // It may be that the complete channel is gone in the meanwhile
+                        if (!_this) return;
 
-                    // try_lock can fail spuriously
-                    while (true) {
-                        lock_t lock(_this->_timeout_function_control, std::try_to_lock);
-                        if (!lock) continue;
+                        // try_lock can fail spuriously
+                        while (true) {
+                            lock_t lock(_this->_timeout_function_control, std::try_to_lock);
+                            if (!lock) continue;
 
-                        // we were cancelled
-                        if (get_process_state(_this->_process).first != process_state::yield) {
-                            _this->try_broadcast();
-                            _this->_timeout_function_active = false;
+                            // we were cancelled
+                            if (get_process_state(_this->_process).first != process_state::yield) {
+                                _this->try_broadcast();
+                                _this->_timeout_function_active = false;
+                            }
+                            return;
                         }
-                        return;
-                    }
-                });
+                    });
             }
         } catch (...) { // this catches exceptions during _process.await() and _process.yield()
             broadcast(std::move(std::current_exception()));
@@ -1098,12 +1085,14 @@ struct shared_process
         REVISIT (sparent) : See above comments on step() and ensure consistency.
 
         What is this code doing, if we don't have a yield then it also assumes no await?
+
+        This seems to be doing a lot for a (required) noexcept operation - are we sure?
     */
 
     template <typename U>
-    auto step() -> std::enable_if_t<!has_process_yield_v<unwrap_reference_t<U>>> {
+    auto step() noexcept -> std::enable_if_t<!has_process_yield_v<unwrap_reference_t<U>>> {
         using queue_t = typename Q::value_type;
-        stlab::optional<queue_t> message;
+        std::optional<queue_t> message;
         std::array<bool, sizeof...(Args)> do_cts;
         bool do_close = false;
 
@@ -1121,8 +1110,6 @@ struct shared_process
                 do_close = true;
             } else {
                 try {
-                    // The message cannot be moved because boost::variant supports r-values just
-                    // since 1.65.
                     broadcast(
                         avoid_invoke_variant<process_t, queue_t, R, Q::arguments_size, Args...>(
                             std::move(*_process), *message));
@@ -1135,7 +1122,7 @@ struct shared_process
     }
 
     void run() {
-        _executor([_p = make_weak_ptr(this->shared_from_this())] {
+        _executor([_p = make_weak_ptr(this->shared_from_this())]() noexcept {
             auto p = _p.lock();
             if (p) p->template step<T>();
         });
@@ -1352,8 +1339,7 @@ auto zip(S s, R... r) {
 
 /**************************************************************************************************/
 
-struct buffer_size 
-{
+struct buffer_size {
     std::size_t _value;
     buffer_size(std::size_t b) : _value(b) {}
 };
@@ -1363,8 +1349,8 @@ struct buffer_size
 namespace detail {
 
 struct annotations {
-    stlab::optional<executor_t> _executor;
-    stlab::optional<std::size_t> _buffer_size;
+    std::optional<executor_t> _executor;
+    std::optional<std::size_t> _buffer_size;
 
     annotations(executor_t e, std::size_t bs) : _executor(std::move(e)), _buffer_size(bs) {}
     explicit annotations(executor_t e) : _executor(std::move(e)) {}
@@ -1378,15 +1364,16 @@ struct annotated_process {
     F _f;
     annotations _annotations;
 
-    explicit annotated_process(executor_task_pair<F>&& etp) : _f(std::move(etp._f)), _annotations(std::move(etp._executor)) {}
+    explicit annotated_process(executor_task_pair<F>&& etp) :
+        _f(std::move(etp._f)), _annotations(std::move(etp._executor)) {}
 
     annotated_process(F f, const executor& e) : _f(std::move(f)), _annotations(e._executor) {}
     annotated_process(F f, buffer_size bs) : _f(std::move(f)), _annotations(bs._value) {}
 
     annotated_process(F f, executor&& e) : _f(std::move(f)), _annotations(std::move(e._executor)) {}
     annotated_process(F f, annotations&& a) : _f(std::move(f)), _annotations(std::move(a)) {}
-    annotated_process(executor_task_pair<F>&& etp, buffer_size bs) : _f(std::move(etp._f)), _annotations(std::move(etp._executor), bs) {}
-    
+    annotated_process(executor_task_pair<F>&& etp, buffer_size bs) :
+        _f(std::move(etp._f)), _annotations(std::move(etp._executor), bs) {}
 };
 
 template <typename B, typename E>
@@ -1553,8 +1540,8 @@ public:
     }
 
     auto operator|(sender<T> send) {
-        return operator|
-            ([_send = std::move(send)](auto&& x) { _send(std::forward<decltype(x)>(x)); });
+        return operator|(
+            [_send = std::move(send)](auto&& x) { _send(std::forward<decltype(x)>(x)); });
     }
 };
 
@@ -1620,8 +1607,8 @@ public:
         if (p) p->send(std::forward<A>(args)...);
     }
 
-    optional<std::size_t> free_buffer() const {
-        optional<std::size_t> result;
+    std::optional<std::size_t> free_buffer() const {
+        std::optional<std::size_t> result;
         auto p = _p.lock();
         if (p) result = p->free_buffer();
         return result;
@@ -1678,8 +1665,8 @@ public:
         if (p) p->send(std::forward<A>(args)...);
     }
 
-    optional<std::size_t> free_buffer() const {
-        optional<std::size_t> result;
+    std::optional<std::size_t> free_buffer() const {
+        std::optional<std::size_t> result;
         auto p = _p.lock();
         if (p) result = p->free_buffer();
         return result;
